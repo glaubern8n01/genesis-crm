@@ -1,0 +1,8 @@
+{
+  "name": "Gênesis CRM - Rafael Gusmão",
+  "description": "CRM White Label humanizado para automação de funis nutracêuticos via WhatsApp Cloud API.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
