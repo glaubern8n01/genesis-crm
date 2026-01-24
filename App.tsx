@@ -9,10 +9,50 @@ const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState('chats');
 
   const handleLogin = (email: string) => {
-    if (email === 'glaubermcorreia@gmail.com') {
+    if (email === 'glaubern8n01@gmail.com' || email === 'glaubermcorreia@gmail.com') { // Permitting both for safety
       setIsAuthenticated(true);
     }
   };
+
+  // --- ENV VAR CHECK ---
+  const missingEnvs: string[] = [];
+  if (!import.meta.env.VITE_SUPABASE_URL) missingEnvs.push('VITE_SUPABASE_URL');
+  if (!import.meta.env.VITE_SUPABASE_ANON_KEY) missingEnvs.push('VITE_SUPABASE_ANON_KEY');
+
+  if (missingEnvs.length > 0) {
+    return (
+      <div className="flex flex-col items-center justify-center h-screen bg-slate-900 text-white p-8">
+        <div className="bg-rose-500/10 border border-rose-500/50 p-8 rounded-2xl max-w-2xl w-full">
+          <div className="flex items-center gap-4 mb-6">
+            <div className="p-3 bg-rose-500 rounded-lg">
+              <Settings className="w-8 h-8 text-white" />
+            </div>
+            <div>
+              <h1 className="text-2xl font-bold">Configuração Ausente</h1>
+              <p className="text-rose-200">O app não pode iniciar sem as variáveis de ambiente.</p>
+            </div>
+          </div>
+
+          <div className="space-y-4 mb-8">
+            <p className="font-semibold text-lg">Variáveis faltando:</p>
+            <ul className="list-disc list-inside space-y-2 text-rose-300 font-mono bg-black/30 p-4 rounded-xl">
+              {missingEnvs.map(env => <li key={env}>{env}</li>)}
+            </ul>
+          </div>
+
+          <div className="bg-slate-800 p-6 rounded-xl">
+            <h3 className="font-bold text-emerald-400 mb-2">Como corrigir no Vercel:</h3>
+            <ol className="list-decimal list-inside space-y-2 text-slate-300 text-sm">
+              <li>Acesse seu projeto no Vercel Dashboard.</li>
+              <li>Vá em <strong>Settings</strong> {'>'} <strong>Environment Variables</strong>.</li>
+              <li>Adicione as chaves acima com os valores do seu projeto Supabase.</li>
+              <li>Faça um <strong>Redeploy</strong> (ou push no git) para aplicar.</li>
+            </ol>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   if (!isAuthenticated) {
     return <Login onLogin={handleLogin} />;
