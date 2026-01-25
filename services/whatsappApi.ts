@@ -1,96 +1,80 @@
+import { supabase } from './supabaseClient';
 
 /**
- * WhatsApp Cloud API Service
+ * WhatsApp Cloud API Service (Secure Backend Version)
  */
 
-const WHATSAPP_TOKEN = import.meta.env.VITE_WHATSAPP_TOKEN;
-const PHONE_ID = import.meta.env.VITE_WHATSAPP_PHONE_NUMBER_ID;
-
-if (!WHATSAPP_TOKEN || !PHONE_ID) {
-  console.error("Missing WhatsApp Cloud API Credentials (VITE_WHATSAPP_TOKEN or VITE_WHATSAPP_PHONE_NUMBER_ID)");
-}
+const BACKEND_URL = import.meta.env.VITE_BACKEND_BASE_URL || 'https://placeholder.supabase.co/functions/v1';
 
 const normalizePhone = (to: string): string => {
   return to.replace(/\D/g, '');
 };
 
-const sendRequest = async (body: any, attempt = 1): Promise<any> => {
-  if (!WHATSAPP_TOKEN || !PHONE_ID) return { success: false, error: 'Missing credentials' };
-
+const sendBackendRequest = async (payload: any): Promise<any> => {
   try {
-    const response = await fetch(`https://graph.facebook.com/v24.0/${PHONE_ID}/messages`, {
+    const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+
+    if (sessionError || !session) {
+      console.error("[WhatsApp API] Unauthorized: No active session");
+      return { success: false, error: "Unauthorized" };
+    }
+
+    const response = await fetch(`${BACKEND_URL}/whatsapp-send`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${WHATSAPP_TOKEN}`,
+        'Authorization': `Bearer ${session.access_token}`,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify(body)
+      body: JSON.stringify(payload)
     });
 
     const data = await response.json();
 
-    console.log(`[WhatsApp API] Status: ${response.status}`);
-    console.log(`[WhatsApp API] Response:`, JSON.stringify(data));
-
-    if (response.status >= 500 && attempt === 1) {
-      console.log(`[WhatsApp API] Retrying request due to server error...`);
-      return sendRequest(body, 2);
+    if (!response.ok) {
+      console.error(`[WhatsApp API] Backend Error:`, data);
+      return { success: false, error: data.error || 'Unknown error' };
     }
 
-    return { success: response.ok, data };
+    return { success: true, data };
+
   } catch (error) {
-    console.error(`[WhatsApp API] Error:`, error);
-    if (attempt === 1) {
-      console.log(`[WhatsApp API] Retrying request due to exception...`);
-      return sendRequest(body, 2);
-    }
-    return { success: false, error };
+    console.error(`[WhatsApp API] Network/Client Error:`, error);
+    return { success: false, error: error.message };
   }
 };
 
 export const whatsappApi = {
   /**
-   * Envia mensagem de texto simples.
+   * Envia mensagem de texto via Backend Seguro.
    */
   async sendText(to: string, text: string) {
     const normalizedTo = normalizePhone(to);
-    return sendRequest({
-      messaging_product: "whatsapp",
+    return sendBackendRequest({
       to: normalizedTo,
-      type: "text",
-      text: { body: text }
+      message: text
     });
   },
 
   /**
-   * Envia áudio nativo do funil.
+   * Envia áudio nativo.
+   * Por enquanto envia link de texto para manter compatibilidade.
    */
   async sendAudio(to: string, audioUrl: string) {
-    const normalizedTo = normalizePhone(to);
-    return sendRequest({
-      messaging_product: "whatsapp",
-      to: normalizedTo,
-      type: "audio",
-      audio: { link: audioUrl }
-    });
+    console.warn("[WhatsApp API] sendAudio via backend not fully implemented. Sending link as text.");
+    return this.sendText(to, `[AUDIO]: ${audioUrl}`);
   },
 
   /**
-   * Envia vídeo de prova social.
+   * Envia vídeo.
+   * Por enquanto envia link de texto.
    */
   async sendVideo(to: string, videoUrl: string) {
-    const normalizedTo = normalizePhone(to);
-    return sendRequest({
-      messaging_product: "whatsapp",
-      to: normalizedTo,
-      type: "video",
-      video: { link: videoUrl }
-    });
+    console.warn("[WhatsApp API] sendVideo via backend not fully implemented. Sending link as text.");
+    return this.sendText(to, `[VIDEO]: ${videoUrl}`);
   },
 
   /**
-   * Marca a conversa no banco de dados/webhook como humana.
-   * Interrompe qualquer processamento automático futuro.
+   * Marca conversa como humana (Client-side logic only for now).
    */
   async markConversationAsHuman(contactId: string) {
     console.log(`[Handoff] Marking conversation ${contactId} as human.`);
