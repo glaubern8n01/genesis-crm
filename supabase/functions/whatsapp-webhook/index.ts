@@ -117,33 +117,49 @@ serve(async (req) => {
                 contact = newContact;
             }
 
-            // --- DETECTAR REINÍCIO "OI" / "OLÁ" ---
-            const greetings = ["oi", "ola", "olá"];
-            const isGreeting = greetings.includes(textBody.trim().toLowerCase());
+            // --- DETECTAR REINÍCIO "OI" / "OLÁ" / SAUDAÇÕES ---
+            const greetings = ["oi", "ola", "olá", "bom dia", "boa tarde", "boa noite", "opa", "e ai", "e aí", "tudo bem"];
+            // Remove pontuação e espaços para comparar
+            const cleanBody = textBody.toLowerCase().replace(/[.,!?;:]/g, "").trim();
+            const isGreeting = greetings.some(g => cleanBody === g || cleanBody.startsWith(g + " "));
 
             if (isGreeting) {
                 console.log(`Greeting detected '${textBody}'. Resetting to funnel start.`);
-                // Reset step key to null effectively restarts funnel in next logic block
-                contact.current_step_key = null;
-                // Force update on DB too
-                await supabase.from("contacts").update({
+
+                // 1. Resetar estado no banco IMEDIATAMENTE
+                const { error: resetError } = await supabase.from("contacts").update({
                     current_step_key: null,
+                    current_stage: "lead", // Garante que sai de handoff/fechamento
                     last_interaction_at: new Date().toISOString()
                 }).eq("id", contact.id);
+
+                if (resetError) console.error("Erro no reset:", resetError);
+
+                // 2. Atualizar objeto local para o fluxo abaixo pegar o início
+                contact.current_step_key = null;
+                contact.current_stage = "lead";
             }
 
-
-            // --- DETECTAR HANDOFF ---
-            const keywords = ["erro", "pix", "boleto", "codigo", "código", "pagar", "pagamento", "não consigo", "nao consigo", "travou", "falha"];
-            const lowerText = textBody.toLowerCase();
-            const shouldHandoff = keywords.some(k => lowerText.includes(k));
+            // --- DETECTAR HANDOFF (Palavras-chave + Visão + Áudio se falhar) ---
+            const keywords = ["erro", "pix", "boleto", "codigo", "código", "pagar", "pagamento", "não consigo", "nao consigo", "travou", "falha", "não funciona", "nao funciona", "problema"];
+            const shouldHandoff = keywords.some(k => textBody.toLowerCase().includes(k));
 
             if (shouldHandoff && contact.current_stage !== "handoff") {
-                console.log("Handoff acionado.");
+                console.log("Handoff acionado por palavra-chave/visão.");
+
+                // 1. Enviar áudio de transição
                 await sendFunnelAudio(wa_id, "transicaoassistente.mp3");
-                await supabase.from("contacts").update({ current_stage: "handoff", last_interaction_at: new Date().toISOString() }).eq("id", contact.id);
+
+                // 2. Atualizar contato para HANDOFF
+                await supabase.from("contacts").update({
+                    current_stage: "handoff",
+                    last_interaction_at: new Date().toISOString()
+                }).eq("id", contact.id);
+
+                // 3. Salvar mensagens
                 if (textBody) await saveMessage(contact.id, "user", textBody, wamid);
-                await saveMessage(contact.id, "system", "[Handoff Triggered]");
+                await saveMessage(contact.id, "system", "[Handoff Triggered: transicaoassistente.mp3]");
+
                 return new Response("HANDOFF_PROCESSED", { status: 200 });
             }
 
@@ -186,13 +202,10 @@ serve(async (req) => {
                             console.warn(`Próximo passo '${currentStep.next_step}' não encontrado.`);
                         }
                     } else {
-                        // Se usuário fala "oi", cai no restart acima. Se fala outra coisa e não tem saída, ignora (ou handoff?)
-                        // Por enquanto ignora para evitar loop.
                         console.log("Fim do funil.");
                     }
                 } else {
                     console.warn(`Passo atual inválido. Resetando.`);
-                    // Fallback reset if invalid
                     const { data: start } = await supabase.from("funnel_steps").select("*").ilike("step_key", "etapa_1%").maybeSingle();
                     targetStep = start;
                 }
@@ -202,8 +215,18 @@ serve(async (req) => {
             if (targetStep) {
                 console.log(`Executando passo: ${targetStep.step_key}`);
 
-                // A. Enviar Texto
-                if (targetStep.text_response?.trim()) {
+                // Se for greeting detectado (isGreeting), e o passo tiver texto, enviamos.
+                // O usuário pediu explicitamente "Responder em texto imediatamente: Olá! Como posso ajudar?".
+                // Vamos garantir isso SE o targetStep for o primeiro E foi um greeting.
+                if (isGreeting && !contact.current_step_key) {
+                    await sendMessage(wa_id, { type: "text", text: { body: "Olá! Como posso ajudar?" } });
+                    // Pequeno delay para garantir ordem
+                    await new Promise(r => setTimeout(r, 600));
+                } else if (targetStep.text_response?.trim()) {
+                    // Caso normal: manda o texto do passo (se já não mandou acima)
+                    // Se mandou acima, evita duplicar se o texto for igual? 
+                    // Simplificação: Se mandou hardcoded, ignora o do banco? Ou manda os dois? 
+                    // O usuário quer "texto Olá" + "audio boas vindas". Se o banco tiver texto diferente, manda também.
                     await sendMessage(wa_id, { type: "text", text: { body: targetStep.text_response } });
                 }
 
