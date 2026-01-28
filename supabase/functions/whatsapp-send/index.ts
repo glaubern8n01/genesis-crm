@@ -157,8 +157,17 @@ async function uploadMediaToWhatsApp(bytes: ArrayBuffer, mimeType: string): Prom
     const formData = new FormData();
     formData.append("messaging_product", "whatsapp");
 
+    // Normalize OGG for WhatsApp
+    if (mimeType === "application/ogg") mimeType = "audio/ogg";
+
     let ext = "bin";
-    if (mimeType.includes("audio")) ext = "mp3";
+
+    if (mimeType.includes("audio") || mimeType.includes("ogg")) ext = "ogg";
+    if (mimeType.includes("mpeg")) ext = "mp3";
+
+    // Force OGG if mime has ogg
+    if (mimeType.includes("ogg")) ext = "ogg";
+
     if (mimeType.includes("video")) ext = "mp4";
     if (mimeType.includes("image")) ext = "jpg";
     if (mimeType.includes("pdf")) ext = "pdf";

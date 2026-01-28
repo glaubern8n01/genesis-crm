@@ -54,7 +54,7 @@ serve(async (req) => {
                 try {
                     const mediaUrl = await getMediaUrl(audioId);
                     if (mediaUrl) {
-                        const { bytes, mimeType } = await downloadMedia(mediaUrl);
+                        const { bytes, mimeType } = await downloadMedia(mediaUrl, WHATSAPP_TOKEN);
                         const transcription = await transcribeWithWhisper(bytes, mimeType);
                         textBody = transcription || "[Áudio sem transcrição]";
                     }
@@ -67,7 +67,7 @@ serve(async (req) => {
                 try {
                     const mediaUrl = await getMediaUrl(imageId);
                     if (mediaUrl && OPENAI_API_KEY) {
-                        const { bytes, mimeType } = await downloadMedia(mediaUrl);
+                        const { bytes, mimeType } = await downloadMedia(mediaUrl, WHATSAPP_TOKEN);
                         const visionText = await analyzeImageWithOpenAI(bytes, mimeType);
                         textBody = visionText || "[Imagem sem texto]";
                     } else {
@@ -117,134 +117,89 @@ serve(async (req) => {
                 contact = newContact;
             }
 
-            // --- DETECTAR REINÍCIO "OI" / "OLÁ" / SAUDAÇÕES ---
-            const greetings = ["oi", "ola", "olá", "bom dia", "boa tarde", "boa noite", "opa", "e ai", "e aí", "tudo bem"];
-            // Remove pontuação e espaços para comparar
-            const cleanBody = textBody.toLowerCase().replace(/[.,!?;:]/g, "").trim();
-            const isGreeting = greetings.some(g => cleanBody === g || cleanBody.startsWith(g + " "));
+            // --- INTENT CLASSIFICATION ---
+            const cleanBody = textBody.toLowerCase();
 
-            if (isGreeting) {
-                console.log(`Greeting detected '${textBody}'. Resetting to funnel start.`);
+            // 1. HANDOFF / ERRO (Highest Priority)
+            const handoffKeywords = ["erro", "não consigo pagar", "nao consigo pagar", "pix não vai", "boleto falhou", "travou", "falha", "não funciona", "problema"];
+            const isHandoff = handoffKeywords.some(k => cleanBody.includes(k));
 
-                // 1. Resetar estado no banco IMEDIATAMENTE
-                const { error: resetError } = await supabase.from("contacts").update({
-                    current_step_key: null,
-                    current_stage: "lead", // Garante que sai de handoff/fechamento
-                    last_interaction_at: new Date().toISOString()
-                }).eq("id", contact.id);
+            if (isHandoff && contact.current_stage !== "handoff") {
+                console.log("🔥 HANDOFF TRIGGERED");
+                await sendFunnelAudio(wa_id, "transacaoassistente.ogg", contact.id);
 
-                if (resetError) console.error("Erro no reset:", resetError);
-
-                // 2. Atualizar objeto local para o fluxo abaixo pegar o início
-                contact.current_step_key = null;
-                contact.current_stage = "lead";
-            }
-
-            // --- DETECTAR HANDOFF (Palavras-chave + Visão + Áudio se falhar) ---
-            const keywords = ["erro", "pix", "boleto", "codigo", "código", "pagar", "pagamento", "não consigo", "nao consigo", "travou", "falha", "não funciona", "nao funciona", "problema"];
-            const shouldHandoff = keywords.some(k => textBody.toLowerCase().includes(k));
-
-            if (shouldHandoff && contact.current_stage !== "handoff") {
-                console.log("Handoff acionado por palavra-chave/visão.");
-
-                // 1. Enviar áudio de transição
-                await sendFunnelAudio(wa_id, "transicaoassistente.mp3");
-
-                // 2. Atualizar contato para HANDOFF
                 await supabase.from("contacts").update({
                     current_stage: "handoff",
                     last_interaction_at: new Date().toISOString()
                 }).eq("id", contact.id);
 
-                // 3. Salvar mensagens
-                if (textBody) await saveMessage(contact.id, "user", textBody, wamid);
-                await saveMessage(contact.id, "system", "[Handoff Triggered: transicaoassistente.mp3]");
-
+                await saveMessage(contact.id, "system", "[Handoff Triggered: transacaoassistente.ogg]");
                 return new Response("HANDOFF_PROCESSED", { status: 200 });
             }
 
-            // 5. DETERMINAR PRÓXIMO PASSO
-            let targetStep: any = null;
+            // Stop if already in handoff (Human takeover)
+            if (contact.current_stage === "handoff") {
+                return new Response("IN_HANDOFF", { status: 200 });
+            }
 
-            if (!contact.current_step_key) {
-                // >>>> CENÁRIO: INÍCIO DO FUNIL (OU RESTART) <<<<
-                const { data: steps } = await supabase
-                    .from("funnel_steps")
-                    .select("*")
-                    .order("created_at", { ascending: true });
+            // 2. PAGAMENTO NA ENTREGA (FAQ)
+            const paymentKeywords = ["pagamento na entrega", "pagar na entrega", "pagar quando receber", "paga na entrega", "pagamento entrega"];
+            const isPaymentQuestion = paymentKeywords.some(k => cleanBody.includes(k));
 
-                if (steps && steps.length > 0) {
-                    // Prioridade: 'etapa_1', 'welcome', 'boas_vindas'
-                    targetStep = steps.find((s: any) => s.step_key.toLowerCase().startsWith("etapa_1")) ||
-                        steps.find((s: any) => s.step_key.toLowerCase().includes("welcome")) ||
-                        steps.find((s: any) => s.step_key.toLowerCase().includes("boas_vinda")) ||
-                        steps[0];
+            if (isPaymentQuestion) {
+                console.log("💰 PAYMENT FAQ TRIGGERED");
+                await sendFunnelAudio(wa_id, "pagamento_na_entrega.ogg", contact.id);
+                await saveMessage(contact.id, "system", "[FAQ: pagamento_na_entrega.ogg]");
+                // Does NOT advance funnel step, just answers question
+                return new Response("FAQ_SENT", { status: 200 });
+            }
+
+            // 3. GREETING / RESET (Start Funnel)
+            const greetings = ["oi", "ola", "olá", "bom dia", "boa tarde", "boa noite", "opa", "começar", "iniciar"];
+            // Exact match or starts with... simpler: if it contains greeting or is first contact
+            const isGreeting = greetings.some(g => cleanBody === g || cleanBody.startsWith(g + " "));
+            const isNewContact = !contact.current_step_key;
+
+            let targetStepKey: string | null = null;
+
+            if (isGreeting || isNewContact) {
+                console.log("👋 GREETING/NEW DETECTED. Starting Funnel.");
+                targetStepKey = "etapa_1_welcome";
+
+                // Reset in DB if needed (to ensure clean state)
+                if (contact.current_step_key !== "etapa_1_welcome") {
+                    await supabase.from("contacts").update({
+                        current_step_key: "etapa_1_welcome",
+                        current_stage: "lead",
+                        last_interaction_at: new Date().toISOString()
+                    }).eq("id", contact.id);
+                    contact.current_step_key = "etapa_1_welcome"; // Update local
                 }
             } else {
-                // >>>> CENÁRIO: AVANÇAR <<<<
-                const { data: currentStep } = await supabase
-                    .from("funnel_steps")
-                    .select("*")
-                    .eq("step_key", contact.current_step_key)
-                    .maybeSingle();
+                // 4. CONTINUE FUNNEL (Standard Flow)
+                // Get current step to find NEXT
+                if (contact.current_step_key) {
+                    const { data: currentStepDB } = await supabase
+                        .from("funnel_steps")
+                        .select("next_step")
+                        .eq("step_key", contact.current_step_key)
+                        .maybeSingle();
 
-                if (currentStep) {
-                    if (currentStep.next_step) {
-                        const { data: next } = await supabase
-                            .from("funnel_steps")
-                            .select("*")
-                            .eq("step_key", currentStep.next_step)
-                            .maybeSingle();
-
-                        if (next) {
-                            targetStep = next;
-                        } else {
-                            console.warn(`Próximo passo '${currentStep.next_step}' não encontrado.`);
-                        }
+                    if (currentStepDB?.next_step) {
+                        targetStepKey = currentStepDB.next_step;
                     } else {
-                        console.log("Fim do funil.");
+                        console.log("🚫 End of funnel or no next step.");
+                        // Check if we are at the end, maybe silence or manual check?
                     }
                 } else {
-                    console.warn(`Passo atual inválido. Resetando.`);
-                    const { data: start } = await supabase.from("funnel_steps").select("*").ilike("step_key", "etapa_1%").maybeSingle();
-                    targetStep = start;
+                    // Fallback to start
+                    targetStepKey = "etapa_1_welcome";
                 }
             }
 
-            // 6. EXECUTAR PASSO
-            if (targetStep) {
-                console.log(`Executando passo: ${targetStep.step_key}`);
-
-                // Se for greeting detectado (isGreeting), e o passo tiver texto, enviamos.
-                // O usuário pediu explicitamente "Responder em texto imediatamente: Olá! Como posso ajudar?".
-                // Vamos garantir isso SE o targetStep for o primeiro E foi um greeting.
-                if (isGreeting && !contact.current_step_key) {
-                    await sendMessage(wa_id, { type: "text", text: { body: "Olá! Como posso ajudar?" } });
-                    // Pequeno delay para garantir ordem
-                    await new Promise(r => setTimeout(r, 600));
-                } else if (targetStep.text_response?.trim()) {
-                    // Caso normal: manda o texto do passo (se já não mandou acima)
-                    // Se mandou acima, evita duplicar se o texto for igual? 
-                    // Simplificação: Se mandou hardcoded, ignora o do banco? Ou manda os dois? 
-                    // O usuário quer "texto Olá" + "audio boas vindas". Se o banco tiver texto diferente, manda também.
-                    await sendMessage(wa_id, { type: "text", text: { body: targetStep.text_response } });
-                }
-
-                // B. Enviar Áudio/Vídeo
-                if (targetStep.audio_path) {
-                    await sendFunnelAudio(wa_id, targetStep.audio_path);
-                }
-
-                // C. ATUALIZAR CONTATO
-                const { error: updateError } = await supabase.from("contacts").update({
-                    current_step_key: targetStep.step_key,
-                    last_interaction_at: new Date().toISOString()
-                }).eq("id", contact.id);
-
-                if (updateError) console.error("ERRO UPDATE:", updateError);
-
-                // D. Log System
-                await saveMessage(contact.id, "system", targetStep.text_response || `[Mídia: ${targetStep.audio_path}]`);
+            // --- PROCESS STEPS SEQUENCE ---
+            if (targetStepKey) {
+                await processFunnelStep(targetStepKey, wa_id, contact.id);
             }
 
             // 7. SALVAR MSG USER
@@ -262,6 +217,73 @@ serve(async (req) => {
     return new Response("Method Not Allowed", { status: 405 });
 });
 
+// Helper to process step(s) logic including bursts
+async function processFunnelStep(stepKey: string, wa_id: string, contactId: string) {
+    let currentKey: string | null = stepKey;
+
+    // Loop to handle "Burst" sequences (like Social Proofs)
+    // We limit execution to avoid infinite loops, e.g. max 5 steps in one burst
+    let stepsProcessed = 0;
+
+    while (currentKey && stepsProcessed < 5) {
+        console.log(`🚀 Processing Step: ${currentKey}`);
+
+        const { data: step } = await supabase
+            .from("funnel_steps")
+            .select("*")
+            .eq("step_key", currentKey)
+            .maybeSingle();
+
+        if (!step) {
+            console.error(`Step ${currentKey} not found in DB.`);
+            break;
+        }
+
+        // 1. Send Text (if any) - FORCE for Welcome
+        if (currentKey === "etapa_1_welcome") {
+            await sendMessage(wa_id, { type: "text", text: { body: "Olá! Como posso ajudar?" } }, contactId);
+            await new Promise(r => setTimeout(r, 800)); // Natural delay
+        } else if (step.text_response) {
+            await sendMessage(wa_id, { type: "text", text: { body: step.text_response } }, contactId);
+        }
+
+        // 2. Send Audio (if any)
+        if (step.audio_path) {
+            await sendFunnelAudio(wa_id, step.audio_path, contactId);
+        }
+
+        // 3. Update DB State
+        await supabase.from("contacts").update({
+            current_step_key: currentKey,
+            last_interaction_at: new Date().toISOString()
+        }).eq("id", contactId);
+
+        const logMsg = step.text_response
+            ? `${step.text_response} ${step.audio_path ? `[+Audio: ${step.audio_path}]` : ''}`
+            : `[Audio Step: ${step.audio_path}]`;
+
+        await saveMessage(contactId, "system", logMsg);
+
+        // 4. CHECK FOR AUTO-ADVANCE (BURST)
+        // Rule: If it's a "Social Proof" step (etapa_4 -> 5, 5 -> 6, 6 -> 7), advance immediately.
+        // Actually, logic said: "Depois que responder... envia explicando (4)... Provas Sociais (5,6,7) em sequencia".
+        // So 4 is NOT burst. 4 waits for reply. 
+        // 5 (social1), 6 (social2), 7 (social3) should be burst?
+        // Let's implement Burst Logic based on step keys:
+        const isBurstStep = currentKey.startsWith("etapa_5") || currentKey.startsWith("etapa_6");
+
+        if (isBurstStep && step.next_step) {
+            console.log(`⚡ Bursting to next step: ${step.next_step}`);
+            currentKey = step.next_step;
+            await new Promise(r => setTimeout(r, 1500)); // Delay between burst messages
+            stepsProcessed++;
+        } else {
+            // Stop processing, wait for user input for next time
+            currentKey = null;
+        }
+    }
+}
+
 // --- HELPERS (Mesmos da anterior) ---
 async function saveMessage(contactId: string, sender: string, text: string, wamid?: string) {
     await supabase.from("conversations").insert({
@@ -269,27 +291,80 @@ async function saveMessage(contactId: string, sender: string, text: string, wami
     });
 }
 
-async function sendMessage(to: string, messageBody: any) {
+async function sendMessage(to: string, messageBody: any, contactId?: string) {
     const url = `https://graph.facebook.com/v17.0/${WHATSAPP_PHONE_NUMBER_ID}/messages`;
     await new Promise(r => setTimeout(r, 400));
     const payload = { messaging_product: "whatsapp", recipient_type: "individual", to: to, ...messageBody };
     const res = await fetch(url, {
         method: "POST", headers: { "Authorization": `Bearer ${WHATSAPP_TOKEN}`, "Content-Type": "application/json" }, body: JSON.stringify(payload)
     });
-    if (!res.ok) console.error("Send Error:", await res.text());
+    if (!res.ok) {
+        const errorText = await res.text();
+        console.error("Send Error:", errorText);
+        if (contactId) {
+            await supabase.from("conversations").insert({
+                contact_id: contactId,
+                sender: "system",
+                message: `[FATAL SEND ERROR]: ${errorText}`,
+                created_at: new Date().toISOString()
+            });
+        }
+    }
 }
 
-async function sendFunnelAudio(to: string, storagePath: string) {
-    const { data: signed } = await supabase.storage.from("audios_para_transcrever").createSignedUrl(storagePath, 3600);
-    if (!signed?.signedUrl) return;
+async function sendFunnelAudio(to: string, storagePath: string, contactId: string) {
     try {
-        const { bytes, mimeType } = await downloadMedia(signed.signedUrl);
-        const mediaId = await uploadMediaToWhatsApp(bytes, mimeType);
-        const msgType = mimeType.includes("video") ? "video" : "audio";
-        const msgContent = { id: mediaId };
-        if (mediaId) await sendMessage(to, { type: msgType, [msgType]: msgContent });
-        else await sendMessage(to, { type: "audio", audio: { link: signed.signedUrl } });
-    } catch (e) { await sendMessage(to, { type: "audio", audio: { link: signed.signedUrl } }); }
+        // Extract audio_key from storage path
+        // Examples: "boas_vindas.ogg" -> "boas_vindas", "folder/audio.ogg" -> "audio"
+        const audioKey = extractAudioKey(storagePath);
+
+        await saveMessage(contactId, "system", `[AUDIO-SEND] Looking up media_id for key: ${audioKey}`);
+        console.log(`🎵 Sending audio via media_id: ${audioKey}`);
+
+        // Lookup media_id from audio_assets table
+        const { data: asset, error: lookupError } = await supabase
+            .from("audio_assets")
+            .select("media_id, mime_type")
+            .eq("audio_key", audioKey)
+            .maybeSingle();
+
+        if (lookupError || !asset?.media_id) {
+            const errorMsg = `Media ID not found for audio_key: ${audioKey}. Please upload this audio first using whatsapp-media-upload endpoint.`;
+            console.error(errorMsg);
+            await saveMessage(contactId, "system", `[ERRO] ${errorMsg}`);
+            throw new Error(errorMsg);
+        }
+
+        const mediaId = asset.media_id;
+        await saveMessage(contactId, "system", `[AUDIO-SEND] Using media_id: ${mediaId} (key: ${audioKey})`);
+        console.log(`✅ Found media_id: ${mediaId} for ${audioKey}`);
+
+        // Send audio message using media_id (WhatsApp Cloud API standard)
+        await sendMessage(to, {
+            type: "audio",
+            audio: { id: mediaId }
+        }, contactId);
+
+        console.log(`📤 Audio sent successfully: ${audioKey} -> ${to}`);
+
+    } catch (e: any) {
+        console.error("Erro sendFunnelAudio:", e);
+        if (contactId) {
+            await saveMessage(contactId, "system", `[ERRO ENVIO AUDIO]: ${e.message}`);
+        }
+        // NÃO FAZER FALLBACK PARA LINK - Audio must be pre-uploaded
+        throw e;
+    }
+}
+
+// Helper function to extract audio_key from storage path
+function extractAudioKey(storagePath: string): string {
+    // Remove directory path and file extension
+    // "folder/audio.ogg" -> "audio"
+    // "boas_vindas.ogg" -> "boas_vindas"
+    // "transacaoassistente.ogg" -> "transacaoassistente"
+    const filename = storagePath.split('/').pop() || storagePath;
+    return filename.replace(/\.(ogg|mp3|m4a|wav)$/i, '');
 }
 
 async function getMediaUrl(mediaId: string): Promise<string | null> {
@@ -299,10 +374,25 @@ async function getMediaUrl(mediaId: string): Promise<string | null> {
     return data.url || null;
 }
 
-async function downloadMedia(url: string): Promise<{ bytes: ArrayBuffer, mimeType: string }> {
-    const res = await fetch(url, { headers: { "Authorization": `Bearer ${WHATSAPP_TOKEN}` } });
-    if (!res.ok) throw new Error("Download Fail");
-    const mimeType = res.headers.get("content-type") || "application/octet-stream";
+// downloadMedia function removed - no longer needed with media_id approach
+// Media is uploaded once via whatsapp-media-upload endpoint and reused
+
+async function downloadMedia(url: string, authToken?: string): Promise<{ bytes: ArrayBuffer, mimeType: string }> {
+    // Keep for image/audio transcription (incoming messages)
+    const headers: any = {};
+    if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
+
+    console.log("Downloading media from:", url);
+    const res = await fetch(url, { headers });
+    if (!res.ok) throw new Error(`Download Fail: ${res.statusText}`);
+
+    let mimeType = res.headers.get("content-type") || "application/octet-stream";
+    console.log("Downloaded Content-Type:", mimeType);
+
+    if (url.includes(".ogg")) {
+        mimeType = "audio/ogg";
+    }
+
     const bytes = await res.arrayBuffer();
     return { bytes, mimeType };
 }
@@ -337,19 +427,6 @@ async function analyzeImageWithOpenAI(bytes: ArrayBuffer, mimeType: string): Pro
     return data.choices?.[0]?.message?.content || null;
 }
 
-async function uploadMediaToWhatsApp(bytes: ArrayBuffer, mimeType: string): Promise<string | null> {
-    const formData = new FormData();
-    formData.append("messaging_product", "whatsapp");
-    let ext = "bin";
-    if (mimeType.includes("audio")) ext = "mp3";
-    if (mimeType.includes("video")) ext = "mp4";
-    if (mimeType.includes("image")) ext = "jpg";
-    formData.append("file", new Blob([bytes], { type: mimeType }), `file.${ext}`);
-    formData.append("type", mimeType);
-    const res = await fetch(`https://graph.facebook.com/v17.0/${WHATSAPP_PHONE_NUMBER_ID}/media`, {
-        method: "POST", headers: { "Authorization": `Bearer ${WHATSAPP_TOKEN}` }, body: formData
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
-    return data.id || null;
-}
+// uploadMediaToWhatsApp function removed - no longer needed for funnel audio
+// All funnel audio is pre-uploaded via whatsapp-media-upload endpoint
+// This function was used for on-demand upload, which is now eliminated
