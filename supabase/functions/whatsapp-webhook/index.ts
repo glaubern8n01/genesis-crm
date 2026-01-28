@@ -30,7 +30,7 @@ serve(async (req) => {
     if (req.method === "POST") {
         try {
             const payload = await req.json();
-            console.log("Payload:", JSON.stringify(payload));
+            // console.log("Payload:", JSON.stringify(payload));
 
             const entry = payload.entry?.[0];
             const change = entry?.changes?.[0];
@@ -70,11 +70,32 @@ serve(async (req) => {
                     }
                 } catch (err) {
                     console.error("Erro no fluxo de transcrição:", err);
-                    // Não falhar o request, apenas seguir sem texto (ou tratar como erro)
                 }
             } else if (message.type === "image") {
-                console.log("Imagem recebida. Placeholder para OCR futuro.");
-                textBody = "[IMAGEM RECEBIDA]";
+                // É imagem. Tentar OCR (Vision) se API Key existir.
+                const imageId = message.image.id;
+                console.log(`Recebida imagem ID: ${imageId}. Iniciando Vision...`);
+
+                try {
+                    const mediaUrl = await getMediaUrl(imageId);
+                    if (mediaUrl && OPENAI_API_KEY) {
+                        // Vision precisa de URL pública ou base64. Graph API URL precisa de header auth.
+                        // OpenAI não aceita header auth na URL. Precisamos baixar e converter pra base64.
+                        const { bytes, mimeType } = await downloadMedia(mediaUrl);
+                        const visionText = await analyzeImageWithOpenAI(bytes, mimeType);
+                        if (visionText) {
+                            console.log(`Vision result: "${visionText}"`);
+                            textBody = visionText;
+                        } else {
+                            textBody = "[IMAGEM SEM TEXTO DETECTADO]";
+                        }
+                    } else {
+                        textBody = "[IMAGEM RECEBIDA]";
+                    }
+                } catch (err) {
+                    console.error("Erro no fluxo de imagem:", err);
+                    textBody = "[IMAGEM COM ERRO]";
+                }
             }
 
             // 3. DEDUPLICAÇÃO
@@ -104,154 +125,129 @@ serve(async (req) => {
                         phone: wa_id,
                         name: name,
                         current_stage: "lead",
-                        // current_step_key será preenchido na lógica de envio
+                        // current_step_key vazio
                     })
                     .select()
                     .single();
 
                 if (createError || !newContact) {
-                    console.error("Erro criar contato:", createError);
                     throw new Error("Falha ao criar contato");
                 }
                 contact = newContact;
+            }
+
+            // --- DETECTAR HANDOFF POR PALAVRAS-CHAVE ---
+            // Se o texto (transcrição ou OCR) contiver palavras de erro, forçar handoff.
+            // "erro", "pix", "boleto", "código", "não consigo", "pagamento"
+            const keywords = ["erro", "pix", "boleto", "codigo", "código", "pagar", "pagamento", "não consigo", "nao consigo", "travou", "falha"];
+            const lowerText = textBody.toLowerCase();
+            const shouldHandoff = keywords.some(k => lowerText.includes(k));
+
+            if (shouldHandoff && contact.current_stage !== "handoff") {
+                console.log("Handoff trigger detectado por palavra-chave:", textBody);
+
+                // 1. Enviar áudio de transição
+                const handoffAudio = "transicaoassistente.mp3";
+                await sendFunnelAudio(wa_id, handoffAudio);
+
+                // 2. Atualizar contato para stage handoff
+                await supabase.from("contacts").update({
+                    current_stage: "handoff",
+                    last_interaction_at: new Date().toISOString()
+                }).eq("id", contact.id);
+
+                // 3. Salvar msg do user
+                if (textBody) {
+                    await supabase.from("conversations").insert({
+                        contact_id: contact.id, sender: "user", message: textBody, wa_message_id: wamid, created_at: new Date().toISOString()
+                    });
+                }
+                // 4. Salvar msg do sistema
+                await supabase.from("conversations").insert({
+                    contact_id: contact.id, sender: "system", message: `[Handoff Triggered] ${handoffAudio}`, created_at: new Date().toISOString()
+                });
+
+                // Tentar criar alerta de handoff se tabela existir (opcional, based on previous context)
+                // await supabase.from("ticket_handoff").insert(...)
+
+                return new Response("EVENT_PROCESSED_HANDOFF", { status: 200 });
             }
 
             // 5. DETERMINAR PASSO DO FUNIL (TARGET STEP)
             let targetStep: any = null;
 
             if (!contact.current_step_key) {
-                // --- CENÁRIO: NOVO NO FUNIL ---
+                // --- CENÁRIO: PRIMEIRO CONTATO (WELCOME) ---
                 const { data: firstStep } = await supabase
                     .from("funnel_steps")
                     .select("*")
-                    .ilike("step_key", "etapa_1%")
+                    .ilike("step_key", "etapa_1%") // Assume etapa_1 é welcome
                     .limit(1)
                     .maybeSingle();
 
                 if (firstStep) {
                     targetStep = firstStep;
                 } else {
-                    const { data: oldestStep } = await supabase
-                        .from("funnel_steps")
-                        .select("*")
-                        .order("created_at", { ascending: true })
-                        .limit(1)
-                        .maybeSingle();
-                    targetStep = oldestStep;
+                    // Fallback 
+                    const { data: oldest } = await supabase.from("funnel_steps").select("*").order("created_at", { ascending: true }).limit(1).maybeSingle();
+                    targetStep = oldest;
                 }
 
             } else {
-                // --- CENÁRIO: JÁ NO FUNIL ---
+                // --- CENÁRIO: AVANÇAR PASSO ---
+                // O usuário JÁ está em um passo. Ele respondeu. Agora queremos avançar.
                 const { data: currentStep } = await supabase
                     .from("funnel_steps")
                     .select("*")
                     .eq("step_key", contact.current_step_key)
                     .maybeSingle();
 
-                if (currentStep) {
-                    if (currentStep.next_step) {
-                        const { data: next } = await supabase
-                            .from("funnel_steps")
-                            .select("*")
-                            .eq("step_key", currentStep.next_step)
-                            .maybeSingle();
-                        targetStep = next;
-                    } else {
-                        targetStep = currentStep;
-                    }
-                } else {
-                    console.warn("Passo atual inválido, reiniciando funil.");
-                    const { data: firstBack } = await supabase
+                if (currentStep && currentStep.next_step) {
+                    const { data: next } = await supabase
                         .from("funnel_steps")
                         .select("*")
-                        .ilike("step_key", "etapa_1%")
+                        .eq("step_key", currentStep.next_step)
                         .maybeSingle();
-                    targetStep = firstBack;
+                    targetStep = next;
+                } else {
+                    // Sem próximo passo ou passo inválido -> Mantém (ou reinicia se quiser, mas manter é safer)
+                    // targetStep = currentStep; (Se quiser repetir a msg anterior)
+                    // Mas geralmente se funil acabou, não manda nada ou manda para handoff.
+                    // Vamos tentar handoff se funil acabou? Ou apenas não faz nada?
+                    // Por enquanto: se não tem next, não faz nada (usuário fala e ninguém responde, ou handoff manual)
                 }
             }
 
-            // 6. EXECUTAR AÇÃO (ENVIAR E SALVAR)
+            // 6. EXECUTAR AÇÃO
             if (targetStep) {
                 console.log(`Executando passo: ${targetStep.step_key}`);
 
-                // A. Enviar TEXTO (Request Separado)
+                // A. TEXTO
                 if (targetStep.text_response && targetStep.text_response.trim().length > 0) {
-                    console.log(`Sending TEXT body length=${targetStep.text_response.length}`);
-                    await sendMessage(wa_id, {
-                        type: "text",
-                        text: { body: targetStep.text_response }
-                    });
+                    await sendMessage(wa_id, { type: "text", text: { body: targetStep.text_response } });
                 }
 
-                // B. Enviar ÁUDIO (Request Separado)
+                // B. ÁUDIO DO FUNIL
                 if (targetStep.audio_path) {
-                    // 1. Gerar Signed URL para baixar o arquivo
-                    const { data: signed, error: storageError } = await supabase.storage
-                        .from("audios_para_transcrever")
-                        .createSignedUrl(targetStep.audio_path, 3600);
-
-                    if (storageError) {
-                        console.error(`Erro Storage ao gerar link para ${targetStep.audio_path}:`, storageError);
-                    } else if (signed?.signedUrl) {
-                        console.log(`Baixando audio para upload nativo: ${targetStep.audio_path}`);
-
-                        try {
-                            // 2. Baixar o arquivo do Supabase
-                            const { bytes, mimeType } = await downloadMedia(signed.signedUrl);
-
-                            // 3. Upload para o WhatsApp
-                            const mediaId = await uploadMediaToWhatsApp(bytes, mimeType);
-
-                            // 4. Enviar com ID
-                            if (mediaId) {
-                                console.log(`Enviando audio NATIVO ID=${mediaId}`);
-                                await sendMessage(wa_id, {
-                                    type: "audio",
-                                    audio: { id: mediaId }
-                                });
-                            } else {
-                                // Fallback se falhar upload (mas ideal seria não falhar)
-                                console.warn("Upload falhou, tentando link (fallback ruim, mas evita silêncio)");
-                                await sendMessage(wa_id, {
-                                    type: "audio",
-                                    audio: { link: signed.signedUrl }
-                                });
-                            }
-                        } catch (err) {
-                            console.error("Erro no envio de mídia nativa:", err);
-                            // Fallback
-                            await sendMessage(wa_id, {
-                                type: "audio",
-                                audio: { link: signed.signedUrl }
-                            });
-                        }
-
-                    } else {
-                        console.error("Erro desconhecido: Signed URL vazia para", targetStep.audio_path);
-                    }
+                    await sendFunnelAudio(wa_id, targetStep.audio_path);
                 }
 
-                // C. Salvar OUTBOUND na conversa (System)
-                await supabase.from("conversations").insert({
-                    contact_id: contact.id,
-                    sender: "system",
-                    message: targetStep.text_response || `[Audio: ${targetStep.audio_path}]`,
-                    wa_message_id: null, // Outbound não tem wamid do Meta
-                    created_at: new Date().toISOString()
-                });
-
-                // D. Atualizar Contato (Estado)
+                // C. ATUALIZAR ESTADO
                 await supabase.from("contacts").update({
                     current_step_key: targetStep.step_key,
                     last_interaction_at: new Date().toISOString()
                 }).eq("id", contact.id);
 
-            } else {
-                console.warn("Nenhum passo encontrado para executar.");
+                // D. LOGAR SYSTEM MSG
+                await supabase.from("conversations").insert({
+                    contact_id: contact.id,
+                    sender: "system",
+                    message: targetStep.text_response || `[Step: ${targetStep.step_key}]`,
+                    created_at: new Date().toISOString()
+                });
             }
 
-            // 7. SALVAR INBOUND MSG (User)
-            // Salvamos no final para garantir que o fluxo rodou
+            // 7. SALVAR MSG DO USER
             if (textBody) {
                 await supabase.from("conversations").insert({
                     contact_id: contact.id,
@@ -277,126 +273,140 @@ serve(async (req) => {
 
 async function sendMessage(to: string, messageBody: any) {
     const url = `https://graph.facebook.com/v17.0/${WHATSAPP_PHONE_NUMBER_ID}/messages`;
-
-    // Pequeno delay para garantir ordem texto -> áudio se chamado rápido
-    await new Promise(r => setTimeout(r, 200));
-
-    const payload = {
-        messaging_product: "whatsapp",
-        recipient_type: "individual",
-        to: to,
-        ...messageBody
-    };
+    await new Promise(r => setTimeout(r, 300)); // Delay
+    const payload = { messaging_product: "whatsapp", recipient_type: "individual", to: to, ...messageBody };
 
     const res = await fetch(url, {
         method: "POST",
-        headers: {
-            "Authorization": `Bearer ${WHATSAPP_TOKEN}`,
-            "Content-Type": "application/json"
-        },
+        headers: { "Authorization": `Bearer ${WHATSAPP_TOKEN}`, "Content-Type": "application/json" },
         body: JSON.stringify(payload)
     });
+    if (!res.ok) console.error("Meta Send Error:", await res.text());
+}
 
-    if (!res.ok) {
-        const errorText = await res.text();
-        console.error("Meta API Erro (Send):", errorText);
-    } else {
-        const successData = await res.json();
-        console.log("Mensagem enviada WhatsApp. ID:", successData?.messages?.[0]?.id);
+async function sendFunnelAudio(to: string, storagePath: string) {
+    // 1. Assina URL
+    const { data: signed } = await supabase.storage.from("audios_para_transcrever").createSignedUrl(storagePath, 3600);
+    if (!signed?.signedUrl) {
+        console.error("Erro signed URL:", storagePath);
+        return;
+    }
+
+    try {
+        // 2. Baixa bytes
+        const { bytes, mimeType } = await downloadMedia(signed.signedUrl);
+        // 3. Upload WhatsApp
+        const mediaId = await uploadMediaToWhatsApp(bytes, mimeType);
+
+        if (mediaId && mimeType.includes("video")) {
+            await sendMessage(to, { type: "video", video: { id: mediaId } });
+        } else if (mediaId) {
+            await sendMessage(to, { type: "audio", audio: { id: mediaId } });
+        } else {
+            // Fallback link
+            await sendMessage(to, { type: "audio", audio: { link: signed.signedUrl } });
+        }
+    } catch (e) {
+        console.error("Erro sendFunnelAudio:", e);
+        // Fallback
+        await sendMessage(to, { type: "audio", audio: { link: signed.signedUrl } });
     }
 }
 
 async function getMediaUrl(mediaId: string): Promise<string | null> {
-    const url = `https://graph.facebook.com/v17.0/${mediaId}`;
-    const res = await fetch(url, {
-        headers: {
-            "Authorization": `Bearer ${WHATSAPP_TOKEN}`
-        }
+    const res = await fetch(`https://graph.facebook.com/v17.0/${mediaId}`, {
+        headers: { "Authorization": `Bearer ${WHATSAPP_TOKEN}` }
     });
-    if (!res.ok) {
-        console.error("Erro getMediaUrl:", await res.text());
-        return null;
-    }
+    if (!res.ok) return null;
     const data = await res.json();
     return data.url || null;
 }
 
 async function downloadMedia(url: string): Promise<{ bytes: ArrayBuffer, mimeType: string }> {
-    const res = await fetch(url, {
-        headers: {
-            "Authorization": `Bearer ${WHATSAPP_TOKEN}`
-        }
-    });
-    if (!res.ok) throw new Error("Falha ao baixar media: " + res.statusText);
+    const res = await fetch(url, { headers: { "Authorization": `Bearer ${WHATSAPP_TOKEN}` } }); // Auth header funciona pra Graph, mas pra Storage Public URL é ignorado (ok)
+    if (!res.ok) throw new Error("Download Error");
     const mimeType = res.headers.get("content-type") || "application/octet-stream";
     const bytes = await res.arrayBuffer();
     return { bytes, mimeType };
 }
 
 async function transcribeWithWhisper(bytes: ArrayBuffer, mimeType: string): Promise<string | null> {
-    if (!OPENAI_API_KEY) {
-        console.error("OPENAI_API_KEY não definida!");
-        return null;
-    }
-
-    // Criar FormData
+    if (!OPENAI_API_KEY) return null;
     const formData = new FormData();
     formData.append("model", "whisper-1");
-    // É importante passar um nome de arquivo com extensão correta para o Whisper identificar
-    // Mapear mimeType comum
     let ext = "mp3";
     if (mimeType.includes("ogg")) ext = "ogg";
-    if (mimeType.includes("wav")) ext = "wav";
-    if (mimeType.includes("m4a")) ext = "m4a";
+    else if (mimeType.includes("wav")) ext = "wav";
+    else if (mimeType.includes("m4a")) ext = "m4a";
 
-    const fileBlob = new Blob([bytes], { type: mimeType });
-    formData.append("file", fileBlob, `audio.${ext}`);
+    formData.append("file", new Blob([bytes], { type: mimeType }), `audio.${ext}`);
 
     const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
         method: "POST",
-        headers: {
-            "Authorization": `Bearer ${OPENAI_API_KEY}`,
-        },
+        headers: { "Authorization": `Bearer ${OPENAI_API_KEY}` },
         body: formData
     });
-
-    if (!res.ok) {
-        const errText = await res.text();
-        console.error("Erro Whisper API:", errText);
-        return null;
-    }
-
+    if (!res.ok) return null;
     const data = await res.json();
     return data.text || null;
 }
 
-async function uploadMediaToWhatsApp(bytes: ArrayBuffer, mimeType: string): Promise<string | null> {
-    const url = `https://graph.facebook.com/v17.0/${WHATSAPP_PHONE_NUMBER_ID}/media`;
+async function analyzeImageWithOpenAI(bytes: ArrayBuffer, mimeType: string): Promise<string | null> {
+    if (!OPENAI_API_KEY) return null;
+    // Base64
+    const base64 = btoa(new Uint8Array(bytes).reduce((data, byte) => data + String.fromCharCode(byte), ''));
+    const urlData = `data:${mimeType};base64,${base64}`;
 
-    const formData = new FormData();
-    formData.append("messaging_product", "whatsapp");
-    const fileBlob = new Blob([bytes], { type: mimeType });
-    // Nome do arquivo é obrigatório em alguns casos
-    let ext = "bin";
-    if (mimeType.includes("audio")) ext = "mp3";
-    if (mimeType.includes("video")) ext = "mp4";
+    const payload = {
+        model: "gpt-4o-mini", // Use mini for speed/cost or gpt-4-turbo
+        messages: [
+            {
+                role: "user",
+                content: [
+                    { type: "text", text: "O que tem nesta imagem? Se for um erro de pagamento, pix, boleto ou print de erro de sistema, descreva claramente 'ERRO PAGAMENTO'. Caso contrário descreva brevemente." },
+                    { type: "image_url", image_url: { url: urlData } }
+                ]
+            }
+        ],
+        max_tokens: 100
+    };
 
-    formData.append("file", fileBlob, `upload.${ext}`);
-    formData.append("type", mimeType);
-
-    const res = await fetch(url, {
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
         method: "POST",
         headers: {
-            "Authorization": `Bearer ${WHATSAPP_TOKEN}`
+            "Authorization": `Bearer ${OPENAI_API_KEY}`,
+            "Content-Type": "application/json"
         },
-        body: formData
+        body: JSON.stringify(payload)
     });
 
     if (!res.ok) {
-        console.error("Erro uploadMediaToWhatsApp:", await res.text());
+        console.error("OpenAI Vision Error:", await res.text());
         return null;
     }
+    const data = await res.json();
+    return data.choices?.[0]?.message?.content || null;
+}
 
+async function uploadMediaToWhatsApp(bytes: ArrayBuffer, mimeType: string): Promise<string | null> {
+    const formData = new FormData();
+    formData.append("messaging_product", "whatsapp");
+    let ext = "bin";
+    if (mimeType.includes("audio")) ext = "mp3";
+    else if (mimeType.includes("video")) ext = "mp4";
+
+    formData.append("file", new Blob([bytes], { type: mimeType }), `file.${ext}`);
+    formData.append("type", mimeType);
+
+    const res = await fetch(`https://graph.facebook.com/v17.0/${WHATSAPP_PHONE_NUMBER_ID}/media`, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${WHATSAPP_TOKEN}` },
+        body: formData
+    });
+    if (!res.ok) {
+        console.error("Upload Media Error:", await res.text());
+        return null;
+    }
     const data = await res.json();
     return data.id || null;
 }
