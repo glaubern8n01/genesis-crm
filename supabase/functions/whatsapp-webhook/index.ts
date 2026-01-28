@@ -7,6 +7,7 @@ const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const META_VERIFY_TOKEN = Deno.env.get("META_VERIFY_TOKEN");
 const WHATSAPP_TOKEN = Deno.env.get("WHATSAPP_TOKEN");
 const WHATSAPP_PHONE_NUMBER_ID = Deno.env.get("WHATSAPP_PHONE_NUMBER_ID");
+const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY");
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
@@ -44,7 +45,37 @@ serve(async (req) => {
             const wa_id = message.from;
             const name = contactInfo?.profile?.name || wa_id;
             const wamid = message.id;
-            const textBody = message.text?.body || "";
+
+            // --- TRATAMENTO DE ÁUDIO/IMAGEM/TEXTO ---
+            let textBody = "";
+
+            if (message.type === "text") {
+                textBody = message.text?.body || "";
+            } else if (message.type === "audio" || (message.type === "document" && message.document?.mime_type?.startsWith("audio/"))) {
+                // É áudio. Buscar URL, baixar e transcrever.
+                const audioId = message.type === "audio" ? message.audio.id : message.document.id;
+                console.log(`Recebido áudio ID: ${audioId}. Iniciando transcrição...`);
+
+                try {
+                    const mediaUrl = await getMediaUrl(audioId);
+                    if (mediaUrl) {
+                        const { bytes, mimeType } = await downloadMedia(mediaUrl);
+                        const transcription = await transcribeWithWhisper(bytes, mimeType);
+                        if (transcription) {
+                            console.log(`Transcrição realizada: "${transcription}"`);
+                            textBody = transcription;
+                        } else {
+                            console.log("Transcrição retornou vazio.");
+                        }
+                    }
+                } catch (err) {
+                    console.error("Erro no fluxo de transcrição:", err);
+                    // Não falhar o request, apenas seguir sem texto (ou tratar como erro)
+                }
+            } else if (message.type === "image") {
+                console.log("Imagem recebida. Placeholder para OCR futuro.");
+                textBody = "[IMAGEM RECEBIDA]";
+            }
 
             // 3. DEDUPLICAÇÃO
             const { data: existing } = await supabase
@@ -90,7 +121,6 @@ serve(async (req) => {
 
             if (!contact.current_step_key) {
                 // --- CENÁRIO: NOVO NO FUNIL ---
-                // Prioridade: step_key começa com 'etapa_1'
                 const { data: firstStep } = await supabase
                     .from("funnel_steps")
                     .select("*")
@@ -101,7 +131,6 @@ serve(async (req) => {
                 if (firstStep) {
                     targetStep = firstStep;
                 } else {
-                    // Fallback: mais antigo
                     const { data: oldestStep } = await supabase
                         .from("funnel_steps")
                         .select("*")
@@ -113,7 +142,6 @@ serve(async (req) => {
 
             } else {
                 // --- CENÁRIO: JÁ NO FUNIL ---
-                // Buscar passo atual
                 const { data: currentStep } = await supabase
                     .from("funnel_steps")
                     .select("*")
@@ -122,7 +150,6 @@ serve(async (req) => {
 
                 if (currentStep) {
                     if (currentStep.next_step) {
-                        // Avançar para o próximo
                         const { data: next } = await supabase
                             .from("funnel_steps")
                             .select("*")
@@ -130,12 +157,9 @@ serve(async (req) => {
                             .maybeSingle();
                         targetStep = next;
                     } else {
-                        // Manter no atual (fim do funil ou sem saída)
                         targetStep = currentStep;
                     }
                 } else {
-                    // Se current_step_key aponta para algo inválido, reiniciar? 
-                    // Vamos reiniciar para segurança.
                     console.warn("Passo atual inválido, reiniciando funil.");
                     const { data: firstBack } = await supabase
                         .from("funnel_steps")
@@ -161,7 +185,7 @@ serve(async (req) => {
 
                 // B. Enviar ÁUDIO (Request Separado)
                 if (targetStep.audio_path) {
-                    // Gerar Signed URL
+                    // 1. Gerar Signed URL para baixar o arquivo
                     const { data: signed, error: storageError } = await supabase.storage
                         .from("audios_para_transcrever")
                         .createSignedUrl(targetStep.audio_path, 3600);
@@ -169,11 +193,39 @@ serve(async (req) => {
                     if (storageError) {
                         console.error(`Erro Storage ao gerar link para ${targetStep.audio_path}:`, storageError);
                     } else if (signed?.signedUrl) {
-                        console.log(`Sending AUDIO link=${signed.signedUrl}`);
-                        await sendMessage(wa_id, {
-                            type: "audio",
-                            audio: { link: signed.signedUrl }
-                        });
+                        console.log(`Baixando audio para upload nativo: ${targetStep.audio_path}`);
+
+                        try {
+                            // 2. Baixar o arquivo do Supabase
+                            const { bytes, mimeType } = await downloadMedia(signed.signedUrl);
+
+                            // 3. Upload para o WhatsApp
+                            const mediaId = await uploadMediaToWhatsApp(bytes, mimeType);
+
+                            // 4. Enviar com ID
+                            if (mediaId) {
+                                console.log(`Enviando audio NATIVO ID=${mediaId}`);
+                                await sendMessage(wa_id, {
+                                    type: "audio",
+                                    audio: { id: mediaId }
+                                });
+                            } else {
+                                // Fallback se falhar upload (mas ideal seria não falhar)
+                                console.warn("Upload falhou, tentando link (fallback ruim, mas evita silêncio)");
+                                await sendMessage(wa_id, {
+                                    type: "audio",
+                                    audio: { link: signed.signedUrl }
+                                });
+                            }
+                        } catch (err) {
+                            console.error("Erro no envio de mídia nativa:", err);
+                            // Fallback
+                            await sendMessage(wa_id, {
+                                type: "audio",
+                                audio: { link: signed.signedUrl }
+                            });
+                        }
+
                     } else {
                         console.error("Erro desconhecido: Signed URL vazia para", targetStep.audio_path);
                     }
@@ -199,7 +251,7 @@ serve(async (req) => {
             }
 
             // 7. SALVAR INBOUND MSG (User)
-            // Salvamos no final para garantir que o fluxo rodou, mas poderia ser no começo.
+            // Salvamos no final para garantir que o fluxo rodou
             if (textBody) {
                 await supabase.from("conversations").insert({
                     contact_id: contact.id,
@@ -221,10 +273,10 @@ serve(async (req) => {
     return new Response("Method Not Allowed", { status: 405 });
 });
 
-// Helper de envio do WhatsApp
+// --- HELPERS ---
+
 async function sendMessage(to: string, messageBody: any) {
-    const url = `https://graph.facebook.com/v17.0/${Deno.env.get("WHATSAPP_PHONE_NUMBER_ID")}/messages`;
-    const token = Deno.env.get("WHATSAPP_TOKEN");
+    const url = `https://graph.facebook.com/v17.0/${WHATSAPP_PHONE_NUMBER_ID}/messages`;
 
     // Pequeno delay para garantir ordem texto -> áudio se chamado rápido
     await new Promise(r => setTimeout(r, 200));
@@ -236,12 +288,10 @@ async function sendMessage(to: string, messageBody: any) {
         ...messageBody
     };
 
-    // console.log("Sending payload:", JSON.stringify(payload)); 
-
     const res = await fetch(url, {
         method: "POST",
         headers: {
-            "Authorization": `Bearer ${token}`,
+            "Authorization": `Bearer ${WHATSAPP_TOKEN}`,
             "Content-Type": "application/json"
         },
         body: JSON.stringify(payload)
@@ -249,9 +299,104 @@ async function sendMessage(to: string, messageBody: any) {
 
     if (!res.ok) {
         const errorText = await res.text();
-        console.error("Meta API Erro:", errorText);
+        console.error("Meta API Erro (Send):", errorText);
     } else {
         const successData = await res.json();
         console.log("Mensagem enviada WhatsApp. ID:", successData?.messages?.[0]?.id);
     }
+}
+
+async function getMediaUrl(mediaId: string): Promise<string | null> {
+    const url = `https://graph.facebook.com/v17.0/${mediaId}`;
+    const res = await fetch(url, {
+        headers: {
+            "Authorization": `Bearer ${WHATSAPP_TOKEN}`
+        }
+    });
+    if (!res.ok) {
+        console.error("Erro getMediaUrl:", await res.text());
+        return null;
+    }
+    const data = await res.json();
+    return data.url || null;
+}
+
+async function downloadMedia(url: string): Promise<{ bytes: ArrayBuffer, mimeType: string }> {
+    const res = await fetch(url, {
+        headers: {
+            "Authorization": `Bearer ${WHATSAPP_TOKEN}`
+        }
+    });
+    if (!res.ok) throw new Error("Falha ao baixar media: " + res.statusText);
+    const mimeType = res.headers.get("content-type") || "application/octet-stream";
+    const bytes = await res.arrayBuffer();
+    return { bytes, mimeType };
+}
+
+async function transcribeWithWhisper(bytes: ArrayBuffer, mimeType: string): Promise<string | null> {
+    if (!OPENAI_API_KEY) {
+        console.error("OPENAI_API_KEY não definida!");
+        return null;
+    }
+
+    // Criar FormData
+    const formData = new FormData();
+    formData.append("model", "whisper-1");
+    // É importante passar um nome de arquivo com extensão correta para o Whisper identificar
+    // Mapear mimeType comum
+    let ext = "mp3";
+    if (mimeType.includes("ogg")) ext = "ogg";
+    if (mimeType.includes("wav")) ext = "wav";
+    if (mimeType.includes("m4a")) ext = "m4a";
+
+    const fileBlob = new Blob([bytes], { type: mimeType });
+    formData.append("file", fileBlob, `audio.${ext}`);
+
+    const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+        method: "POST",
+        headers: {
+            "Authorization": `Bearer ${OPENAI_API_KEY}`,
+        },
+        body: formData
+    });
+
+    if (!res.ok) {
+        const errText = await res.text();
+        console.error("Erro Whisper API:", errText);
+        return null;
+    }
+
+    const data = await res.json();
+    return data.text || null;
+}
+
+async function uploadMediaToWhatsApp(bytes: ArrayBuffer, mimeType: string): Promise<string | null> {
+    const url = `https://graph.facebook.com/v17.0/${WHATSAPP_PHONE_NUMBER_ID}/media`;
+
+    const formData = new FormData();
+    formData.append("messaging_product", "whatsapp");
+    const fileBlob = new Blob([bytes], { type: mimeType });
+    // Nome do arquivo é obrigatório em alguns casos
+    let ext = "bin";
+    if (mimeType.includes("audio")) ext = "mp3";
+    if (mimeType.includes("video")) ext = "mp4";
+
+    formData.append("file", fileBlob, `upload.${ext}`);
+    formData.append("type", mimeType);
+
+    const res = await fetch(url, {
+        method: "POST",
+        headers: {
+            "Authorization": `Bearer ${WHATSAPP_TOKEN}`
+        },
+        body: formData
+    });
+
+    if (!res.ok) {
+        console.error("Erro uploadMediaToWhatsApp:", await res.text());
+        return null;
+    }
+
+    const data = await res.json();
+    return data.id || null;
 }

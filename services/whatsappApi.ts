@@ -60,17 +60,24 @@ export const whatsappApi = {
    * Por enquanto envia link de texto para manter compatibilidade.
    */
   async sendAudio(to: string, audioUrl: string) {
-    console.warn("[WhatsApp API] sendAudio via backend not fully implemented. Sending link as text.");
-    return this.sendText(to, `[AUDIO]: ${audioUrl}`);
+    const normalizedTo = normalizePhone(to);
+    return sendBackendRequest({
+      to: normalizedTo,
+      type: "audio",
+      media_url: audioUrl
+    });
   },
 
   /**
    * Envia vídeo.
-   * Por enquanto envia link de texto.
    */
   async sendVideo(to: string, videoUrl: string) {
-    console.warn("[WhatsApp API] sendVideo via backend not fully implemented. Sending link as text.");
-    return this.sendText(to, `[VIDEO]: ${videoUrl}`);
+    const normalizedTo = normalizePhone(to);
+    return sendBackendRequest({
+      to: normalizedTo,
+      type: "video",
+      media_url: videoUrl
+    });
   },
 
   /**
