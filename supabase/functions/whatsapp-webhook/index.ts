@@ -148,8 +148,8 @@ serve(async (req) => {
 
             if (isPaymentQuestion) {
                 console.log("💰 PAYMENT FAQ TRIGGERED");
-                await sendFunnelAudio(wa_id, "pagamento_na_entrega.ogg", contact.id);
-                await saveMessage(contact.id, "system", "[FAQ: pagamento_na_entrega.ogg]");
+                await sendFunnelAudio(wa_id, "pagamentonaentrega.ogg", contact.id);
+                await saveMessage(contact.id, "system", "[FAQ: pagamentonaentrega.ogg]");
                 // Does NOT advance funnel step, just answers question
                 return new Response("FAQ_SENT", { status: 200 });
             }
@@ -249,7 +249,13 @@ async function processFunnelStep(stepKey: string, wa_id: string, contactId: stri
 
         // 2. Send Audio (if any)
         if (step.audio_path) {
-            await sendFunnelAudio(wa_id, step.audio_path, contactId);
+            try {
+                await sendFunnelAudio(wa_id, step.audio_path, contactId);
+            } catch (audioError: any) {
+                // Don't block funnel if audio fails - log and continue
+                console.error(`⚠️ Audio failed for step ${currentKey}, but continuing:`, audioError.message);
+                await saveMessage(contactId, "system", `[AUDIO FAILED - ${step.audio_path}]: ${audioError.message}`);
+            }
         }
 
         // 3. Update DB State
@@ -314,12 +320,12 @@ async function sendMessage(to: string, messageBody: any, contactId?: string) {
 
 async function sendFunnelAudio(to: string, storagePath: string, contactId: string) {
     try {
-        // Extract audio_key from storage path
-        // Examples: "boas_vindas.ogg" -> "boas_vindas", "folder/audio.ogg" -> "audio"
-        const audioKey = extractAudioKey(storagePath);
+        // Extract and normalize audio_key from storage path
+        const rawKey = extractAudioKey(storagePath);
+        const audioKey = normalizeAudioKey(rawKey);
 
-        await saveMessage(contactId, "system", `[AUDIO-SEND] Looking up media_id for key: ${audioKey}`);
-        console.log(`🎵 Sending audio via media_id: ${audioKey}`);
+        console.log(`🎵 [AUDIO-LOOKUP] Raw key: ${rawKey} | Normalized: ${audioKey}`);
+        await saveMessage(contactId, "system", `[AUDIO-LOOKUP] Searching for: ${audioKey}`);
 
         // Lookup media_id from audio_assets table
         const { data: asset, error: lookupError } = await supabase
@@ -329,42 +335,105 @@ async function sendFunnelAudio(to: string, storagePath: string, contactId: strin
             .maybeSingle();
 
         if (lookupError || !asset?.media_id) {
-            const errorMsg = `Media ID not found for audio_key: ${audioKey}. Please upload this audio first using whatsapp-media-upload endpoint.`;
+            const errorMsg = `[AUDIO-LOOKUP] ❌ NOT FOUND: ${audioKey} (raw: ${rawKey})`;
             console.error(errorMsg);
-            await saveMessage(contactId, "system", `[ERRO] ${errorMsg}`);
-            throw new Error(errorMsg);
+            await saveMessage(contactId, "system", errorMsg);
+            throw new Error(`Media ID not found for: ${audioKey}`);
         }
 
         const mediaId = asset.media_id;
-        await saveMessage(contactId, "system", `[AUDIO-SEND] Using media_id: ${mediaId} (key: ${audioKey})`);
-        console.log(`✅ Found media_id: ${mediaId} for ${audioKey}`);
+        console.log(`✅ [AUDIO-LOOKUP] FOUND: ${audioKey} → media_id: ${mediaId}`);
+        await saveMessage(contactId, "system", `[AUDIO-SEND] media_id: ${mediaId}`);
 
-        // Send audio message using media_id (WhatsApp Cloud API standard)
-        await sendMessage(to, {
+        // Send audio message using media_id
+        const waPayload = {
             type: "audio",
             audio: { id: mediaId }
-        }, contactId);
+        };
 
-        console.log(`📤 Audio sent successfully: ${audioKey} -> ${to}`);
+        console.log(`📤 [AUDIO-SEND] Sending to WhatsApp API: ${to}`);
+        const sendResult = await sendMessageWithStatus(to, waPayload, contactId);
+
+        if (sendResult.success) {
+            console.log(`✅ [AUDIO-SEND] SUCCESS: ${audioKey} → ${to}`);
+            await saveMessage(contactId, "system", `[AUDIO-SENT] ✅ ${audioKey}`);
+        } else {
+            console.error(`❌ [AUDIO-SEND] FAILED: ${sendResult.error}`);
+            await saveMessage(contactId, "system", `[AUDIO-FAILED] ${sendResult.error}`);
+            throw new Error(sendResult.error);
+        }
 
     } catch (e: any) {
-        console.error("Erro sendFunnelAudio:", e);
+        console.error("❌ [AUDIO-ERROR]:", e.message);
         if (contactId) {
-            await saveMessage(contactId, "system", `[ERRO ENVIO AUDIO]: ${e.message}`);
+            await saveMessage(contactId, "system", `[AUDIO-ERROR]: ${e.message}`);
         }
-        // NÃO FAZER FALLBACK PARA LINK - Audio must be pre-uploaded
-        throw e;
+        throw e; // Re-throw to be caught by try-catch in processFunnelStep
     }
 }
 
 // Helper function to extract audio_key from storage path
 function extractAudioKey(storagePath: string): string {
     // Remove directory path and file extension
-    // "folder/audio.ogg" -> "audio"
-    // "boas_vindas.ogg" -> "boas_vindas"
-    // "transacaoassistente.ogg" -> "transacaoassistente"
     const filename = storagePath.split('/').pop() || storagePath;
     return filename.replace(/\.(ogg|mp3|m4a|wav)$/i, '');
+}
+
+// Robust audio key normalizer - handles name variations
+function normalizeAudioKey(key: string): string {
+    // Mapper for known variations
+    const mapper: Record<string, string> = {
+        "pagamento_na_entrega": "pagamentonaentrega",
+        "pagamento_entrega": "pagamentonaentrega",
+        "transacao_assistente": "transicaoassistente",
+        "prova_social1": "provasocial1",
+        "prova_social2": "provasocial2",
+        "prova_social3": "provasocial3"
+    };
+
+    // Check if direct match exists in mapper
+    if (mapper[key]) {
+        console.log(`🔄 [NORMALIZE] ${key} → ${mapper[key]}`);
+        return mapper[key];
+    }
+
+    // Return as-is if no mapping needed
+    return key;
+}
+
+// Enhanced sendMessage with status return
+async function sendMessageWithStatus(to: string, messageBody: any, contactId?: string): Promise<{ success: boolean, error?: string }> {
+    try {
+        const url = `https://graph.facebook.com/v17.0/${WHATSAPP_PHONE_NUMBER_ID}/messages`;
+        await new Promise(r => setTimeout(r, 400));
+        const payload = { messaging_product: "whatsapp", recipient_type: "individual", to: to, ...messageBody };
+
+        const res = await fetch(url, {
+            method: "POST",
+            headers: { "Authorization": `Bearer ${WHATSAPP_TOKEN}`, "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+        });
+
+        const responseText = await res.text();
+
+        if (!res.ok) {
+            console.error(`❌ WhatsApp API Error (${res.status}):`, responseText);
+            if (contactId) {
+                await saveMessage(contactId, "system", `[WA-API-ERROR ${res.status}]: ${responseText}`);
+            }
+            return { success: false, error: `HTTP ${res.status}: ${responseText}` };
+        }
+
+        console.log(`✅ WhatsApp API Success (${res.status})`);
+        return { success: true };
+
+    } catch (error: any) {
+        console.error("❌ Send Error:", error.message);
+        if (contactId) {
+            await saveMessage(contactId, "system", `[SEND-ERROR]: ${error.message}`);
+        }
+        return { success: false, error: error.message };
+    }
 }
 
 async function getMediaUrl(mediaId: string): Promise<string | null> {
